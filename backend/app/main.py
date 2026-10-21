@@ -9,6 +9,9 @@ from fastapi.responses import JSONResponse
 from app.api.v1.auth import router as auth_router
 from app.api.v1.businesses import router as businesses_router
 from app.api.v1.health import router as health_router
+from app.api.v1.receptionist_configurations import (
+    router as receptionist_configurations_router,
+)
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -64,3 +67,4 @@ async def request_id_middleware(request: Request, call_next):
 app.include_router(health_router, prefix=settings.API_V1_PREFIX)
 app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
 app.include_router(businesses_router, prefix=settings.API_V1_PREFIX)
+app.include_router(receptionist_configurations_router, prefix=settings.API_V1_PREFIX)

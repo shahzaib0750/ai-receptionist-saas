@@ -9,6 +9,7 @@ from app.core.security import verify_password
 from app.db.session import Base, get_db
 from app.main import app
 from app.models.business import Business, BusinessMember, BusinessRole
+from app.models.receptionist_configuration import ReceptionistConfiguration
 from app.models.user import User
 from app.services.business_authorization import (
     BusinessPermission,
@@ -71,6 +72,36 @@ def login(client: TestClient, email: str = "person@example.com") -> str:
     )
     assert response.status_code == 200
     return response.json()["access_token"]
+
+
+def create_business(client: TestClient, email: str, name: str) -> dict[str, object]:
+    token = login(client, email)
+    response = client.post(
+        "/api/v1/businesses",
+        json={"name": name},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def add_business_member(
+    session_factory: sessionmaker[Session],
+    business_id: UUID,
+    email: str,
+    role: BusinessRole,
+) -> None:
+    with session_factory() as session:
+        user = session.scalar(select(User).where(User.email == email))
+        assert user is not None
+        session.add(
+            BusinessMember(
+                business_id=business_id,
+                user_id=user.id,
+                role=role,
+            )
+        )
+        session.commit()
 
 
 def assert_response_has_no_internal_fields(data: dict[str, object]) -> None:
@@ -505,6 +536,344 @@ def test_duplicate_business_membership_is_rejected(
             )
         ).all()
         assert len(memberships) == 1
+
+
+def test_owner_can_create_retrieve_and_update_receptionist_configuration(
+    client: TestClient,
+) -> None:
+    register(client, "receptionist-owner@example.com")
+    business = create_business(client, "receptionist-owner@example.com", "Receptionist Co")
+    business_id = business["id"]
+    headers = {
+        "Authorization": f"Bearer {login(client, 'receptionist-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business_id}/receptionist-configuration"
+    payload = {
+        "assistant_name": "Avery",
+        "greeting_message": "Hello, how can I help?",
+        "business_timezone": "America/New_York",
+    }
+
+    created = client.post(url, json=payload, headers=headers)
+    assert created.status_code == 201
+    configuration = created.json()
+    assert configuration["business_id"] == business_id
+    assert configuration["assistant_name"] == "Avery"
+    assert configuration["is_enabled"] is True
+    assert_response_has_no_internal_fields(configuration)
+
+    retrieved = client.get(url, headers=headers)
+    assert retrieved.status_code == 200
+    assert retrieved.json() == configuration
+
+    updated = client.patch(
+        url,
+        json={
+            "greeting_message": "Welcome!",
+            "business_timezone": "Europe/London",
+            "is_enabled": False,
+        },
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["id"] == configuration["id"]
+    assert updated.json()["assistant_name"] == "Avery"
+    assert updated.json()["greeting_message"] == "Welcome!"
+    assert updated.json()["business_timezone"] == "Europe/London"
+    assert updated.json()["is_enabled"] is False
+    assert_response_has_no_internal_fields(updated.json())
+
+
+def test_admin_can_create_and_update_receptionist_configuration(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+) -> None:
+    register(client, "configuration-owner@example.com")
+    business = create_business(
+        client,
+        "configuration-owner@example.com",
+        "Admin Managed Business",
+    )
+    register(client, "configuration-admin@example.com")
+    add_business_member(
+        session_factory,
+        UUID(business["id"]),
+        "configuration-admin@example.com",
+        BusinessRole.ADMIN,
+    )
+    headers = {
+        "Authorization": f"Bearer {login(client, 'configuration-admin@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    payload = {
+        "assistant_name": "Jordan",
+        "greeting_message": "How may I help?",
+        "business_timezone": "UTC",
+    }
+
+    created = client.post(url, json=payload, headers=headers)
+    assert created.status_code == 201
+    updated = client.patch(
+        url,
+        json={"assistant_name": "Jordan Admin"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["assistant_name"] == "Jordan Admin"
+
+
+def test_member_can_read_but_cannot_write_receptionist_configuration(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+) -> None:
+    register(client, "member-policy-owner@example.com")
+    business = create_business(
+        client,
+        "member-policy-owner@example.com",
+        "Member Read Business",
+    )
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    owner_headers = {
+        "Authorization": f"Bearer {login(client, 'member-policy-owner@example.com')}"
+    }
+    payload = {
+        "assistant_name": "Sam",
+        "greeting_message": "Hello.",
+        "business_timezone": "UTC",
+    }
+    created = client.post(url, json=payload, headers=owner_headers)
+    assert created.status_code == 201
+
+    register(client, "configuration-member@example.com")
+    add_business_member(
+        session_factory,
+        UUID(business["id"]),
+        "configuration-member@example.com",
+        BusinessRole.MEMBER,
+    )
+    member_headers = {
+        "Authorization": f"Bearer {login(client, 'configuration-member@example.com')}"
+    }
+    assert client.get(url, headers=member_headers).status_code == 200
+    assert client.post(url, json=payload, headers=member_headers).status_code == 403
+    assert (
+        client.patch(url, json={"assistant_name": "Changed"}, headers=member_headers).status_code
+        == 403
+    )
+
+
+def test_receptionist_configuration_requires_authentication(
+    client: TestClient,
+) -> None:
+    url = f"/api/v1/businesses/{uuid4()}/receptionist-configuration"
+    payload = {
+        "assistant_name": "Alex",
+        "greeting_message": "Hello.",
+        "business_timezone": "UTC",
+    }
+    assert client.get(url).status_code == 401
+    assert client.post(url, json=payload).status_code == 401
+    assert client.patch(url, json={"is_enabled": False}).status_code == 401
+
+
+def test_non_member_cannot_access_another_business_configuration(
+    client: TestClient,
+) -> None:
+    register(client, "tenant-owner@example.com")
+    business = create_business(client, "tenant-owner@example.com", "Tenant Business")
+    owner_headers = {
+        "Authorization": f"Bearer {login(client, 'tenant-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    created = client.post(
+        url,
+        json={
+            "assistant_name": "Casey",
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+        },
+        headers=owner_headers,
+    )
+    assert created.status_code == 201
+
+    register(client, "outsider@example.com")
+    outsider_headers = {
+        "Authorization": f"Bearer {login(client, 'outsider@example.com')}"
+    }
+    assert client.get(url, headers=outsider_headers).status_code == 404
+    assert client.patch(
+        url,
+        json={"assistant_name": "Intruder"},
+        headers=outsider_headers,
+    ).status_code == 404
+    assert client.post(
+        url,
+        json={
+            "assistant_name": "Intruder",
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+        },
+        headers=outsider_headers,
+    ).status_code == 404
+
+
+def test_receptionist_configuration_duplicate_returns_conflict(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+) -> None:
+    register(client, "duplicate-owner@example.com")
+    business = create_business(client, "duplicate-owner@example.com", "Duplicate Config")
+    headers = {
+        "Authorization": f"Bearer {login(client, 'duplicate-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    payload = {
+        "assistant_name": "Morgan",
+        "greeting_message": "Hello.",
+        "business_timezone": "UTC",
+    }
+    assert client.post(url, json=payload, headers=headers).status_code == 201
+    duplicate = client.post(url, json=payload, headers=headers)
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {
+        "detail": "Receptionist configuration already exists"
+    }
+    with session_factory() as session:
+        existing = session.scalar(
+            select(ReceptionistConfiguration).where(
+                ReceptionistConfiguration.business_id == UUID(business["id"])
+            )
+        )
+        assert existing is not None
+        session.add(
+            ReceptionistConfiguration(
+                business_id=existing.business_id,
+                assistant_name="Duplicate",
+                greeting_message="Duplicate",
+                business_timezone="UTC",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"assistant_name": "", "greeting_message": "Hello.", "business_timezone": "UTC"},
+        {"assistant_name": "Agent", "greeting_message": " ", "business_timezone": "UTC"},
+        {
+            "assistant_name": "Agent",
+            "greeting_message": "Hello.",
+            "business_timezone": "Not/A_Timezone",
+        },
+        {
+            "assistant_name": "x" * 121,
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+        },
+        {
+            "assistant_name": "Agent",
+            "greeting_message": "x" * 2001,
+            "business_timezone": "UTC",
+        },
+        {
+            "assistant_name": "Agent",
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+            "business_id": str(uuid4()),
+        },
+        {
+            "assistant_name": "Agent",
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+            "id": str(uuid4()),
+        },
+        {
+            "assistant_name": "Agent",
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+            "role": "owner",
+        },
+    ],
+)
+def test_receptionist_configuration_rejects_invalid_and_protected_fields(
+    client: TestClient,
+    payload: dict[str, object],
+) -> None:
+    register(client, "validation-owner@example.com")
+    business = create_business(
+        client,
+        "validation-owner@example.com",
+        "Validation Business",
+    )
+    headers = {
+        "Authorization": f"Bearer {login(client, 'validation-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    assert client.post(url, json=payload, headers=headers).status_code == 422
+
+
+def test_receptionist_configuration_update_rejects_protected_fields(
+    client: TestClient,
+) -> None:
+    register(client, "protected-update-owner@example.com")
+    business = create_business(
+        client,
+        "protected-update-owner@example.com",
+        "Protected Update Business",
+    )
+    headers = {
+        "Authorization": f"Bearer {login(client, 'protected-update-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    created = client.post(
+        url,
+        json={
+            "assistant_name": "Protected",
+            "greeting_message": "Hello.",
+            "business_timezone": "UTC",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+
+    invalid_updates = (
+        {"id": str(uuid4())},
+        {"business_id": str(uuid4())},
+        {"owner_user_id": str(uuid4())},
+        {"role": "owner"},
+        {"business_timezone": "Not/A_Timezone"},
+        {"assistant_name": None},
+        {},
+    )
+    for payload in invalid_updates:
+        assert client.patch(url, json=payload, headers=headers).status_code == 422
+
+    current = client.get(url, headers=headers)
+    assert current.status_code == 200
+    assert current.json()["assistant_name"] == "Protected"
+
+
+def test_receptionist_configuration_missing_returns_not_found(
+    client: TestClient,
+) -> None:
+    register(client, "missing-config-owner@example.com")
+    business = create_business(
+        client,
+        "missing-config-owner@example.com",
+        "Missing Configuration",
+    )
+    headers = {
+        "Authorization": f"Bearer {login(client, 'missing-config-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/receptionist-configuration"
+    assert client.get(url, headers=headers).status_code == 404
+    assert (
+        client.patch(url, json={"is_enabled": False}, headers=headers).status_code
+        == 404
+    )
 
 
 def test_existing_health_endpoints(client: TestClient) -> None:
