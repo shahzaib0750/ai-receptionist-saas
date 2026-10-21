@@ -1,4 +1,6 @@
+import json
 from collections.abc import Iterator
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import jwt
@@ -11,6 +13,7 @@ from app.main import app
 from app.models.business import Business, BusinessMember, BusinessRole
 from app.models.receptionist_configuration import ReceptionistConfiguration
 from app.models.user import User
+from app.models.vapi_configuration import VapiConfiguration
 from app.services.business_authorization import (
     BusinessPermission,
     enforce_business_permission,
@@ -19,6 +22,7 @@ from app.services.business_authorization import (
 )
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -874,6 +878,364 @@ def test_receptionist_configuration_missing_returns_not_found(
         client.patch(url, json={"is_enabled": False}, headers=headers).status_code
         == 404
     )
+
+
+def test_vapi_configuration_create_retrieve_and_update(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+) -> None:
+    register(client, "vapi-owner@example.com")
+    business = create_business(client, "vapi-owner@example.com", "Vapi Business")
+    register(client, "vapi-admin@example.com")
+    add_business_member(
+        session_factory,
+        UUID(business["id"]),
+        "vapi-admin@example.com",
+        BusinessRole.ADMIN,
+    )
+
+    owner_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-owner@example.com')}"
+    }
+    admin_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-admin@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/vapi-configuration"
+    created = client.post(
+        url,
+        json={
+            "assistant_id": "assistant-internal-id",
+            "phone_number_id": "phone-internal-id",
+        },
+        headers=owner_headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["assistant_id"] == "assistant-internal-id"
+    assert created.json()["phone_number_id"] == "phone-internal-id"
+    assert "api_key" not in created.json()
+    assert "webhook_secret" not in created.json()
+    assert_response_has_no_internal_fields(created.json())
+
+    retrieved = client.get(url, headers=admin_headers)
+    assert retrieved.status_code == 200
+    assert retrieved.json() == created.json()
+    updated = client.patch(
+        url,
+        json={"assistant_id": "updated-assistant-id", "is_enabled": False},
+        headers=admin_headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["assistant_id"] == "updated-assistant-id"
+    assert updated.json()["phone_number_id"] == "phone-internal-id"
+    assert updated.json()["is_enabled"] is False
+    assert "api_key" not in updated.json()
+    assert "webhook_secret" not in updated.json()
+
+
+def test_vapi_configuration_permissions_cross_tenant_and_duplicates(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+) -> None:
+    register(client, "vapi-tenant-owner@example.com")
+    business = create_business(
+        client,
+        "vapi-tenant-owner@example.com",
+        "Vapi Tenant",
+    )
+    register(client, "vapi-tenant-member@example.com")
+    add_business_member(
+        session_factory,
+        UUID(business["id"]),
+        "vapi-tenant-member@example.com",
+        BusinessRole.MEMBER,
+    )
+    register(client, "vapi-outsider@example.com")
+
+    url = f"/api/v1/businesses/{business['id']}/vapi-configuration"
+    owner_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-tenant-owner@example.com')}"
+    }
+    member_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-tenant-member@example.com')}"
+    }
+    outsider_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-outsider@example.com')}"
+    }
+    payload = {"assistant_id": "tenant-assistant"}
+
+    created = client.post(url, json=payload, headers=owner_headers)
+    assert created.status_code == 201
+    assert client.get(url, headers=member_headers).status_code == 200
+    assert client.post(url, json={"assistant_id": "another"}, headers=member_headers).status_code == 403
+    assert client.patch(url, json={"is_enabled": False}, headers=member_headers).status_code == 403
+    assert client.get(url, headers=outsider_headers).status_code == 404
+    assert client.post(url, json=payload, headers=outsider_headers).status_code == 404
+    assert client.patch(url, json={"is_enabled": False}, headers=outsider_headers).status_code == 404
+    duplicate = client.post(url, json=payload, headers=owner_headers)
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "Vapi configuration already exists"
+    assert client.get(url).status_code == 401
+    assert client.post(url, json=payload).status_code == 401
+    assert client.patch(url, json={"is_enabled": False}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"assistant_id": ""},
+        {"assistant_id": "   "},
+        {"assistant_id": "assistant id with spaces"},
+        {"assistant_id": "x" * 256},
+        {"assistant_id": "assistant", "phone_number_id": ""},
+        {"assistant_id": "assistant", "business_id": str(uuid4())},
+        {"assistant_id": "assistant", "api_key": "do-not-accept"},
+    ],
+)
+def test_vapi_configuration_rejects_invalid_and_protected_fields(
+    client: TestClient,
+    payload: dict[str, object],
+) -> None:
+    register(client, "vapi-validation-owner@example.com")
+    business = create_business(
+        client,
+        "vapi-validation-owner@example.com",
+        "Vapi Validation",
+    )
+    headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-validation-owner@example.com')}"
+    }
+    url = f"/api/v1/businesses/{business['id']}/vapi-configuration"
+    assert client.post(url, json=payload, headers=headers).status_code == 422
+
+
+def test_vapi_configuration_rejects_duplicate_provider_identifiers(
+    client: TestClient,
+) -> None:
+    register(client, "vapi-first-owner@example.com")
+    first_business = create_business(
+        client,
+        "vapi-first-owner@example.com",
+        "First Vapi Business",
+    )
+    first_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-first-owner@example.com')}"
+    }
+    first_url = f"/api/v1/businesses/{first_business['id']}/vapi-configuration"
+    assert client.post(
+        first_url,
+        json={"assistant_id": "shared-assistant"},
+        headers=first_headers,
+    ).status_code == 201
+
+    register(client, "vapi-second-owner@example.com")
+    second_business = create_business(
+        client,
+        "vapi-second-owner@example.com",
+        "Second Vapi Business",
+    )
+    second_headers = {
+        "Authorization": f"Bearer {login(client, 'vapi-second-owner@example.com')}"
+    }
+    second_url = f"/api/v1/businesses/{second_business['id']}/vapi-configuration"
+    collision = client.post(
+        second_url,
+        json={"assistant_id": "shared-assistant"},
+        headers=second_headers,
+    )
+    assert collision.status_code == 409
+    assert collision.json()["detail"] == "Vapi identifiers are already configured"
+
+
+def configure_vapi_webhook_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    token: str | None,
+) -> None:
+    secret = SecretStr(token) if token is not None else None
+    monkeypatch.setattr(
+        "app.services.vapi_webhook_auth.get_settings",
+        lambda: SimpleNamespace(VAPI_WEBHOOK_SECRET=secret),
+    )
+
+
+def vapi_status_payload(
+    *,
+    call_id: str = "call-test-1",
+    assistant_id: str | None = "assistant-webhook",
+    phone_number_id: str | None = "phone-webhook",
+    call_status: str = "ended",
+) -> dict[str, object]:
+    call: dict[str, object] = {"id": call_id}
+    if assistant_id is not None:
+        call["assistantId"] = assistant_id
+    if phone_number_id is not None:
+        call["phoneNumberId"] = phone_number_id
+    return {"message": {"type": "status-update", "call": call, "status": call_status}}
+
+
+def test_vapi_webhook_requires_configured_bearer_auth(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_vapi_webhook_auth(monkeypatch, None)
+    url = "/api/v1/integrations/vapi/webhook"
+    payload = vapi_status_payload()
+    assert client.post(url, json=payload).status_code == 503
+
+    configure_vapi_webhook_auth(monkeypatch, "test-webhook-token")
+    assert client.post(url, json=payload).status_code == 401
+    assert client.post(url, json=payload, headers={"Authorization": "Basic wrong"}).status_code == 401
+    assert (
+        client.post(
+            url,
+            json=payload,
+            headers={"Authorization": "Bearer wrong"},
+        ).status_code
+        == 401
+    )
+
+
+def test_vapi_webhook_accepts_documented_status_update_without_side_effects(
+    client: TestClient,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_vapi_webhook_auth(monkeypatch, "test-webhook-token")
+    register(client, "webhook-owner@example.com")
+    business = create_business(client, "webhook-owner@example.com", "Webhook Business")
+    configuration_url = (
+        f"/api/v1/businesses/{business['id']}/vapi-configuration"
+    )
+    owner_headers = {
+        "Authorization": f"Bearer {login(client, 'webhook-owner@example.com')}"
+    }
+    assert client.post(
+        configuration_url,
+        json={
+            "assistant_id": "assistant-webhook",
+            "phone_number_id": "phone-webhook",
+        },
+        headers=owner_headers,
+    ).status_code == 201
+
+    valid_payload = json.dumps(vapi_status_payload()).encode()
+    webhook_response = client.post(
+        "/api/v1/integrations/vapi/webhook",
+        content=valid_payload,
+        headers={
+            "Authorization": "Bearer test-webhook-token",
+            "Content-Type": "application/json",
+        },
+    )
+    assert webhook_response.status_code == 202
+    assert webhook_response.json() == {"status": "accepted"}
+
+    with session_factory() as session:
+        assert session.scalar(select(VapiConfiguration).where(
+            VapiConfiguration.business_id == UUID(business["id"])
+        )) is not None
+        assert session.scalar(select(BusinessMember.id)) is not None
+        assert session.scalar(select(VapiConfiguration.id).where(
+            VapiConfiguration.assistant_id == "assistant-webhook"
+        )) is not None
+
+
+def test_vapi_webhook_rejects_oversized_stream_without_content_length(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_vapi_webhook_auth(monkeypatch, "test-webhook-token")
+    chunks = iter([b"x" * (64 * 1024 + 1)])
+    response = client.post(
+        "/api/v1/integrations/vapi/webhook",
+        content=chunks,
+        headers={"Authorization": "Bearer test-webhook-token"},
+    )
+    assert response.status_code == 413
+
+
+def test_vapi_webhook_validates_events_and_rejects_unknown_mappings(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_vapi_webhook_auth(monkeypatch, "test-webhook-token")
+    webhook_url = "/api/v1/integrations/vapi/webhook"
+    headers = {"Authorization": "Bearer test-webhook-token"}
+
+    assert client.post(webhook_url, content="{", headers=headers).status_code == 400
+    malformed = client.post(
+        webhook_url,
+        json={"message": {"type": "status-update", "status": "ended", "call": {}}},
+        headers=headers,
+    )
+    assert malformed.status_code == 422
+    invalid_status = client.post(
+        webhook_url,
+        json=vapi_status_payload(call_status="unknown"),
+        headers=headers,
+    )
+    assert invalid_status.status_code == 422
+    unsupported = client.post(
+        webhook_url,
+        json={"message": {"type": "end-of-call-report", "call": {}}},
+        headers=headers,
+    )
+    assert unsupported.status_code == 202
+    assert unsupported.json() == {"status": "ignored"}
+    unknown = client.post(
+        webhook_url,
+        json=vapi_status_payload(
+            assistant_id="unknown-assistant",
+            phone_number_id="unknown-phone",
+        ),
+        headers=headers,
+    )
+    assert unknown.status_code == 404
+
+
+def test_vapi_webhook_rejects_mismatched_identifier_mapping(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_vapi_webhook_auth(monkeypatch, "test-webhook-token")
+    register(client, "mapping-owner-one@example.com")
+    first_business = create_business(
+        client,
+        "mapping-owner-one@example.com",
+        "Mapping One",
+    )
+    first_headers = {
+        "Authorization": f"Bearer {login(client, 'mapping-owner-one@example.com')}"
+    }
+    assert client.post(
+        f"/api/v1/businesses/{first_business['id']}/vapi-configuration",
+        json={"assistant_id": "assistant-one", "phone_number_id": "phone-one"},
+        headers=first_headers,
+    ).status_code == 201
+
+    register(client, "mapping-owner-two@example.com")
+    second_business = create_business(
+        client,
+        "mapping-owner-two@example.com",
+        "Mapping Two",
+    )
+    second_headers = {
+        "Authorization": f"Bearer {login(client, 'mapping-owner-two@example.com')}"
+    }
+    assert client.post(
+        f"/api/v1/businesses/{second_business['id']}/vapi-configuration",
+        json={"assistant_id": "assistant-two", "phone_number_id": "phone-two"},
+        headers=second_headers,
+    ).status_code == 201
+
+    response = client.post(
+        "/api/v1/integrations/vapi/webhook",
+        json=vapi_status_payload(
+            assistant_id="assistant-one",
+            phone_number_id="phone-two",
+        ),
+        headers={"Authorization": "Bearer test-webhook-token"},
+    )
+    assert response.status_code == 404
 
 
 def test_existing_health_endpoints(client: TestClient) -> None:
