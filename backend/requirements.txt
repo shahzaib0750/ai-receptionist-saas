@@ -1,0 +1,13 @@
+alembic
+argon2-cffi
+email-validator
+fastapi
+httpx
+psycopg[binary]
+PyJWT
+pydantic
+pydantic-settings
+pytest
+ruff
+sqlalchemy
+uvicorn
