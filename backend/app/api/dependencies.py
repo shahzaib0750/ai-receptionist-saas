@@ -7,6 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.security import InvalidAccessTokenError, decode_access_token
 from app.db.session import get_db
 from app.models.business import Business, BusinessMember
@@ -20,7 +21,9 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)
+    ],
     db: Annotated[Session, Depends(get_db)],
 ) -> User:
     if credentials is None:
@@ -31,7 +34,7 @@ def get_current_user(
         )
 
     try:
-        user_id: UUID = decode_access_token(credentials.credentials)
+        decoded_token = decode_access_token(credentials.credentials)
     except InvalidAccessTokenError as error:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -39,8 +42,12 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         ) from error
 
-    user = db.get(User, user_id)
-    if user is None or not user.is_active:
+    user = db.get(User, decoded_token.user_id)
+    if (
+        user is None
+        or not user.is_active
+        or user.token_version != decoded_token.token_version
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired access token",
@@ -75,3 +82,25 @@ def require_business_permission(
         return business
 
     return dependency
+
+
+def require_platform_billing_admin(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    try:
+        allowed_user_ids = {
+            UUID(value.strip())
+            for value in get_settings().BILLING_ADMIN_USER_IDS.split(",")
+            if value.strip()
+        }
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform administrator configuration is invalid",
+        ) from error
+    if current_user.id not in allowed_user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform administrator access required",
+        )
+    return current_user

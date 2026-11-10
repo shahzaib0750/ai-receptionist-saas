@@ -9,7 +9,14 @@ from app.api.dependencies import get_current_user
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.user import User
-from app.schemas.auth import LoginRequest, TokenResponse, UserCreate, UserRead
+from app.schemas.auth import (
+    LoginRequest,
+    PasswordChangeRequest,
+    TokenResponse,
+    UserCreate,
+    UserRead,
+    UserUpdate,
+)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
@@ -21,7 +28,9 @@ def register(
 ) -> User:
     email = str(payload.email)
     if db.scalar(select(User.id).where(User.email == email)) is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already registered")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Email is already registered"
+        )
 
     user = User(
         full_name=payload.full_name,
@@ -61,7 +70,7 @@ def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return TokenResponse(access_token=create_access_token(user.id))
+    return TokenResponse(access_token=create_access_token(user.id, user.token_version))
 
 
 @router.get("/me", response_model=UserRead)
@@ -69,3 +78,57 @@ def read_current_user(
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> User:
     return current_user
+
+
+@router.patch("/me", response_model=UserRead)
+def update_current_user(
+    payload: UserUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> User:
+    changes = payload.model_dump(exclude_unset=True)
+    if "email" in changes:
+        changes["email"] = str(changes["email"])
+    for field, value in changes.items():
+        setattr(current_user, field, value)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if (
+            "email" in changes
+            and db.scalar(select(User.id).where(User.email == changes["email"]))
+            is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email is already registered",
+            ) from None
+        raise
+    db.refresh(current_user)
+    return current_user
+
+
+@router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
+def change_password(
+    payload: PasswordChangeRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> None:
+    current_password = payload.current_password.get_secret_value()
+    new_password = payload.new_password.get_secret_value()
+    if not verify_password(current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if verify_password(new_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="New password must differ from the current password",
+        )
+
+    current_user.password_hash = hash_password(new_password)
+    current_user.token_version += 1
+    db.commit()

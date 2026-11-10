@@ -4,10 +4,12 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -33,6 +35,14 @@ class ReceptionistConfiguration(Base):
     assistant_name: Mapped[str] = mapped_column(String(120), nullable=False)
     greeting_message: Mapped[str] = mapped_column(String(2000), nullable=False)
     business_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    requirements_text: Mapped[str | None] = mapped_column(Text)
+    fallback_instructions: Mapped[str | None] = mapped_column(Text)
+    selected_services: Mapped[list[str]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=lambda: ["call_answering"],
+        server_default='["call_answering"]',
+    )
     is_enabled: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

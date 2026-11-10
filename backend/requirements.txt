@@ -3,11 +3,17 @@ argon2-cffi
 email-validator
 fastapi
 httpx
+httpx2
+pgvector==0.5.1
 psycopg[binary]
 PyJWT
 pydantic
 pydantic-settings
+pypdf==7.0.0
+python-multipart==0.0.20
 pytest
 ruff
+sentence-transformers==6.2.0
 sqlalchemy
+torch==2.15.0+cpu
 uvicorn

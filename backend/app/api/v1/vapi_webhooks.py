@@ -3,14 +3,18 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import ValidationError
-from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.vapi_configuration import VapiConfiguration
 from app.schemas.vapi_webhook import (
+    VapiEndOfCallReportEnvelope,
     VapiStatusUpdateEnvelope,
     VapiWebhookEnvelope,
+)
+from app.services.vapi_call_events import (
+    VapiCallEventResult,
+    process_vapi_end_of_call_report,
+    process_vapi_status_update,
 )
 from app.services.vapi_webhook_auth import verify_vapi_webhook_authorization
 
@@ -45,51 +49,6 @@ async def _read_bounded_body(request: Request) -> bytes:
     return b"".join(chunks)
 
 
-def _resolve_vapi_configuration(
-    assistant_id: str | None,
-    phone_number_id: str | None,
-    db: Session,
-) -> VapiConfiguration:
-    identifiers = []
-    if assistant_id is not None:
-        identifiers.append(VapiConfiguration.assistant_id == assistant_id)
-    if phone_number_id is not None:
-        identifiers.append(VapiConfiguration.phone_number_id == phone_number_id)
-    if not identifiers:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Call event is missing configured Vapi identifiers",
-        )
-
-    configurations = db.scalars(
-        select(VapiConfiguration)
-        .where(
-            VapiConfiguration.is_enabled.is_(True),
-            or_(*identifiers),
-        )
-        .limit(2)
-    ).all()
-    if len(configurations) != 1:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Vapi configuration not found",
-        )
-
-    configuration = configurations[0]
-    if (
-        assistant_id is not None
-        and configuration.assistant_id != assistant_id
-    ) or (
-        phone_number_id is not None
-        and configuration.phone_number_id != phone_number_id
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Vapi configuration not found",
-        )
-    return configuration
-
-
 @router.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
 async def receive_vapi_webhook(
     request: Request,
@@ -108,20 +67,30 @@ async def receive_vapi_webhook(
             detail="Invalid webhook payload",
         ) from error
 
-    if envelope.message.type != "status-update":
+    if envelope.message.type == "end-of-call-report":
+        try:
+            event = VapiEndOfCallReportEnvelope.model_validate(payload).message
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Invalid end-of-call report",
+            ) from error
+        result = process_vapi_end_of_call_report(event, db)
+    elif envelope.message.type == "status-update":
+        try:
+            event = VapiStatusUpdateEnvelope.model_validate(payload).message
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Invalid status-update event",
+            ) from error
+        result = process_vapi_status_update(event, db)
+    else:
         return {"status": "ignored"}
 
-    try:
-        event = VapiStatusUpdateEnvelope.model_validate(payload).message
-    except ValidationError as error:
+    if result is VapiCallEventResult.FAILED:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid status-update event",
-        ) from error
-
-    _resolve_vapi_configuration(
-        event.call.assistantId,
-        event.call.phoneNumberId,
-        db,
-    )
-    return {"status": "accepted"}
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Vapi call could not be associated with a business",
+        )
+    return {"status": result.value}

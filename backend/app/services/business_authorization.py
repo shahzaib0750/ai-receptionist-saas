@@ -7,8 +7,10 @@ from app.models.business import BusinessRole
 
 class BusinessPermission(str, Enum):
     READ = "read"
+    READ_CALLS = "read_calls"
     MANAGE_SETTINGS = "manage_settings"
     MANAGE_OPERATIONAL_RESOURCES = "manage_operational_resources"
+    PROVISION_RECEPTIONIST = "provision_receptionist"
     MANAGE_MEMBERS = "manage_members"
     TRANSFER_OWNERSHIP = "transfer_ownership"
     REMOVE_OWNER = "remove_owner"
@@ -19,6 +21,7 @@ _ROLE_PERMISSIONS: dict[BusinessRole, frozenset[BusinessPermission]] = {
     BusinessRole.ADMIN: frozenset(
         {
             BusinessPermission.READ,
+            BusinessPermission.READ_CALLS,
             BusinessPermission.MANAGE_SETTINGS,
             BusinessPermission.MANAGE_OPERATIONAL_RESOURCES,
             BusinessPermission.MANAGE_MEMBERS,
